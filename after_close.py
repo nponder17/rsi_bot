@@ -16,7 +16,7 @@ from telegram_utils import tg_send
 
 ET = pytz.timezone("America/New_York")
 
-TEST_TODAY = "2026-03-06"  # Friday
+TEST_TODAY = None  # Friday
 
 
 def ensure_dir():
