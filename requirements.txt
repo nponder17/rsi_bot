@@ -4,4 +4,5 @@ requests
 pytz
 python-dotenv
 ta
+scikit-learn
 psycopg[binary]

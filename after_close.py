@@ -1,37 +1,172 @@
+"""
+after_close.py — RSI-2 signal scan + ML v6 sizing + VIX 25-30 gate
+
+Run after market close each trading day. Produces a plan for the next open:
+  - SELL: open positions where today's close > MA-20
+  - BUY:  RSI-2 < 5, close > MA-200, VIX NOT in [25,30] → ML quintile notional
+
+ML v6 features (20 total):
+  Base:  rsi_2, pct_from_ma200/50/20, vol_ratio, ret_5d/10d/20d, atr_pct,
+         spy_ret_5d/20d, spy_rsi_14, spy_above_200/50
+  New:   close_in_range, dist_52wk_low, consec_down_days, vix_close, vix_ret_5d,
+         obv_zscore
+
+Quintile sizing:  Q1=$80  Q2=$140  Q3=$200  Q4=$280  Q5=$400
+VIX gate:         skip trades when VIX in [25.0, 30.0]
+"""
+
 import os
+import pickle
+import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
+from io import StringIO
+
 import pytz
+import requests
 
 from bot_config import (
     require_env, DATA_DIR, BOT_NAME,
     RSI_ENTRY_THRESHOLD, RSI_PERIOD,
-    MIN_PRICE, USE_MA200_FILTER,
+    MIN_PRICE, USE_MA200_FILTER, MA_EXIT,
     MAX_NEW_BUYS_PER_DAY, MAX_TOTAL_OPEN_POSITIONS,
+    NOTIONAL_PER_POSITION, QUINTILE_SIZE, MODEL_PATH,
+    VIX_GATE_LO, VIX_GATE_HI, VIX_CSV_URL,
 )
 from alpaca_utils import get_trading_calendar, get_next_trading_day, get_daily_bars
-from indicators import add_indicators
+from indicators import add_indicators, add_spy_features, assign_quintile
 from state_db import init_db, upsert_plan, log_event, open_lots
 from telegram_utils import tg_send
 
 ET = pytz.timezone("America/New_York")
 
-TEST_TODAY = None  # Friday
+TEST_TODAY = None   # override for backtesting, e.g. "2024-01-05"
+
+SPY_SYMBOL = "SPY"
 
 
 def ensure_dir():
     os.makedirs(DATA_DIR, exist_ok=True)
 
 
+def load_model():
+    """Load the serialized v6 ML model. Returns payload dict or None."""
+    if not os.path.exists(MODEL_PATH):
+        print(f"  ⚠️  Model not found at {MODEL_PATH} — using flat $200 sizing.")
+        return None
+    try:
+        with open(MODEL_PATH, "rb") as f:
+            payload = pickle.load(f)
+        print(f"  ✅ Model loaded: trained on {payload.get('trained_on','?')} "
+              f"({payload.get('n_samples',0):,} samples, "
+              f"{len(payload.get('features',[]))} features)")
+        return payload
+    except Exception as e:
+        print(f"  ⚠️  Model load failed: {e} — using flat $200 sizing.")
+        return None
+
+
+def fetch_vix() -> pd.DataFrame:
+    """
+    Download VIX history from CBOE (free, no key).
+    Returns DataFrame with columns: date, vix_close, vix_ret_5d
+    indexed by date.
+    """
+    try:
+        resp = requests.get(VIX_CSV_URL, timeout=20)
+        resp.raise_for_status()
+        df = pd.read_csv(StringIO(resp.text))
+        df.columns = [c.strip().lower() for c in df.columns]
+        df = df.rename(columns={"date": "date", "close": "vix_close"})
+        df["date"] = pd.to_datetime(df["date"]).dt.date
+        df = df.sort_values("date").reset_index(drop=True)
+        df["vix_ret_5d"] = df["vix_close"].pct_change(5) * 100
+        return df.set_index("date")
+    except Exception as e:
+        print(f"  ⚠️  VIX fetch failed: {e}")
+        return pd.DataFrame()
+
+
 def pick_last_good_date(bars: pd.DataFrame, min_coverage: int):
-    coverage = bars.groupby("date")["symbol"].nunique().sort_index()
-    last_date = coverage.index.max()
-    last_cov = int(coverage.loc[last_date]) if last_date is not None else 0
-
-    ok = coverage[coverage >= min_coverage]
-    last_good = ok.index.max() if not ok.empty else None
-
+    coverage    = bars.groupby("date")["symbol"].nunique().sort_index()
+    last_date   = coverage.index.max()
+    last_cov    = int(coverage.loc[last_date]) if last_date is not None else 0
+    ok          = coverage[coverage >= min_coverage]
+    last_good   = ok.index.max() if not ok.empty else None
     return last_good, coverage, last_date, last_cov
+
+
+def score_candidate(row, model_payload, spy_row, vix_row) -> tuple:
+    """
+    Given a signal-date row for one symbol, extract all 20 features,
+    run the ML model, and return (quintile, notional, pred_score).
+    Falls back to Q3 / $200 if any feature is missing or model is None.
+    """
+    fallback = (3, NOTIONAL_PER_POSITION, None)
+
+    if model_payload is None:
+        return fallback
+
+    features   = model_payload["features"]
+    thresholds = model_payload["thresholds"]
+    mdl        = model_payload["model"]
+    q_size     = model_payload.get("quintile_size", QUINTILE_SIZE)
+
+    feat_vals = {}
+
+    # Per-symbol features (from signal-date bar)
+    try:
+        feat_vals["rsi_2_signal"]     = float(row[f"rsi_{RSI_PERIOD}"])
+        feat_vals["pct_from_ma200"]   = float(row["pct_from_ma200"])
+        feat_vals["pct_from_ma50"]    = float(row["pct_from_ma50"])
+        feat_vals["pct_from_ma20"]    = float(row["pct_from_ma20"])
+        feat_vals["vol_ratio"]        = float(row["vol_ratio"])
+        feat_vals["ret_5d"]           = float(row["ret_5d"])
+        feat_vals["ret_10d"]          = float(row["ret_10d"])
+        feat_vals["ret_20d"]          = float(row["ret_20d"])
+        feat_vals["atr_pct"]          = float(row["atr_pct"])
+        feat_vals["close_in_range"]   = float(row["close_in_range"])
+        feat_vals["dist_52wk_low"]    = float(row["dist_52wk_low"])
+        feat_vals["consec_down_days"] = float(row["consec_down_days"])
+        feat_vals["obv_zscore"]       = float(row["obv_zscore"])
+    except (KeyError, TypeError, ValueError):
+        return fallback
+
+    # SPY features
+    if spy_row is not None:
+        try:
+            feat_vals["spy_ret_5d"]    = float(spy_row["spy_ret_5d"])
+            feat_vals["spy_ret_20d"]   = float(spy_row["spy_ret_20d"])
+            feat_vals["spy_rsi_14"]    = float(spy_row["spy_rsi_14"])
+            feat_vals["spy_above_200"] = float(spy_row["spy_above_200"])
+            feat_vals["spy_above_50"]  = float(spy_row["spy_above_50"])
+        except (KeyError, TypeError, ValueError):
+            return fallback
+    else:
+        return fallback
+
+    # VIX features
+    if vix_row is not None:
+        try:
+            feat_vals["vix_close"]  = float(vix_row["vix_close"])
+            feat_vals["vix_ret_5d"] = float(vix_row["vix_ret_5d"])
+        except (KeyError, TypeError, ValueError):
+            return fallback
+    else:
+        return fallback
+
+    # Build feature vector in the exact order the model was trained on
+    try:
+        x = np.array([[feat_vals[f] for f in features]], dtype=float)
+        if np.any(np.isnan(x)):
+            return fallback
+    except (KeyError, ValueError):
+        return fallback
+
+    pred     = float(mdl.predict(x)[0])
+    quintile = assign_quintile(pred, thresholds)
+    notional = q_size.get(quintile, NOTIONAL_PER_POSITION)
+    return quintile, notional, pred
 
 
 def main():
@@ -40,9 +175,10 @@ def main():
     ensure_dir()
 
     now_et = datetime.now(ET)
-    today = datetime.strptime(TEST_TODAY, "%Y-%m-%d").date() if TEST_TODAY else now_et.date()
+    today  = datetime.strptime(TEST_TODAY, "%Y-%m-%d").date() if TEST_TODAY else now_et.date()
 
-    cal = get_trading_calendar(start=str(today - timedelta(days=10)), end=str(today + timedelta(days=30)))
+    cal = get_trading_calendar(start=str(today - timedelta(days=10)),
+                               end=str(today + timedelta(days=30)))
     if cal.empty:
         raise RuntimeError("Trading calendar empty; check Alpaca connectivity.")
 
@@ -53,27 +189,53 @@ def main():
 
     next_td = get_next_trading_day(cal, today_date=today)
 
+    # ── Load ML model ─────────────────────────────────────────────────────────
+    model_payload = load_model()
+
+    # ── Fetch VIX ─────────────────────────────────────────────────────────────
+    print("Fetching VIX from CBOE …")
+    vix_idx = fetch_vix()
+    if vix_idx.empty:
+        print("  ⚠️  No VIX data — VIX gate disabled, VIX features will be missing.")
+
+    # ── Load universe ─────────────────────────────────────────────────────────
     universe_path = os.path.join(DATA_DIR, "universe.csv")
     if not os.path.exists(universe_path):
-        raise RuntimeError(f"Missing {universe_path}. Create it with a 'symbol' column.")
+        raise RuntimeError(f"Missing {universe_path}.")
 
-    symbols = pd.read_csv(universe_path)["symbol"].dropna().astype(str).str.upper().unique().tolist()
+    symbols = (pd.read_csv(universe_path)["symbol"]
+               .dropna().astype(str).str.upper().unique().tolist())
 
+    # Fetch bars for universe + SPY together (700 days for all indicators)
+    fetch_symbols = list(set(symbols + [SPY_SYMBOL]))
     start = (today - timedelta(days=700)).isoformat()
-    end = (today + timedelta(days=1)).isoformat()
+    end   = (today + timedelta(days=1)).isoformat()
 
-    bars = get_daily_bars(symbols, start=start, end=end)
-    if bars.empty:
+    print(f"Fetching bars for {len(fetch_symbols)} symbols (incl. SPY) …")
+    all_bars = get_daily_bars(fetch_symbols, start=start, end=end)
+    if all_bars.empty:
         raise RuntimeError("No bars returned.")
 
-    bars["symbol"] = bars["symbol"].astype(str).str.upper()
+    all_bars["symbol"] = all_bars["symbol"].astype(str).str.upper()
 
+    # Split SPY out before indicator calculation
+    spy_bars  = all_bars[all_bars["symbol"] == SPY_SYMBOL].copy()
+    univ_bars = all_bars[all_bars["symbol"].isin(set(symbols))].copy()
+
+    # ── SPY features ──────────────────────────────────────────────────────────
+    spy_feat_idx = pd.DataFrame()
+    if not spy_bars.empty:
+        spy_feat_idx = add_spy_features(spy_bars)
+    else:
+        print("  ⚠️  SPY bars not returned — SPY features will be missing.")
+
+    # ── Universe indicators ───────────────────────────────────────────────────
     MIN_COVERAGE = min(150, max(30, int(0.6 * len(symbols))))
-    last_good_date, coverage, last_date, last_cov = pick_last_good_date(bars, MIN_COVERAGE)
+    last_good_date, coverage, last_date, last_cov = pick_last_good_date(univ_bars, MIN_COVERAGE)
 
     print("=== Data Diagnostics ===")
     print(f"Requested symbols: {len(symbols)}")
-    print(f"Returned symbols:  {bars['symbol'].nunique()}")
+    print(f"Returned symbols:  {univ_bars['symbol'].nunique()}")
     print(f"Latest date:       {last_date} | coverage={last_cov}")
     print(f"Coverage thresh:   {MIN_COVERAGE}")
     print(f"Using date:        {last_good_date}")
@@ -82,17 +244,21 @@ def main():
     if last_good_date is None:
         raise RuntimeError("No date met minimum coverage threshold.")
 
+    # Filter to tradable price
     latest = (
-        bars[bars["date"] == last_good_date][["symbol", "close"]]
+        univ_bars[univ_bars["date"] == last_good_date][["symbol", "close"]]
         .rename(columns={"close": "last_close"})
     )
     tradable = latest[latest["last_close"] >= MIN_PRICE]["symbol"].tolist()
+    df = univ_bars[univ_bars["symbol"].isin(tradable)].copy()
 
-    df = bars[bars["symbol"].isin(tradable)].copy()
+    print("Calculating indicators …")
     df = add_indicators(df, rsi_period=RSI_PERIOD)
 
-    rsi_col = f"rsi_{RSI_PERIOD}"
+    rsi_col  = f"rsi_{RSI_PERIOD}"
+    exit_ma  = f"ma_{MA_EXIT}"
 
+    # Signal-date slice
     day = df[df["date"] == last_good_date].copy()
     day = day.dropna(subset=[rsi_col, "ma_5"])
     day = day[day["close"] >= MIN_PRICE].copy()
@@ -101,42 +267,102 @@ def main():
         day = day.dropna(subset=["ma_200"])
         day = day[day["close"] > day["ma_200"]].copy()
 
+    # Entry candidates: RSI-2 < threshold
     entry_candidates = day[day[rsi_col] < RSI_ENTRY_THRESHOLD].copy()
     entry_candidates = entry_candidates.sort_values(rsi_col, ascending=True)
 
+    # Current open positions
     current_open = open_lots(include_pending_entry=False)
     if current_open is None or current_open.empty:
         current_open = pd.DataFrame([])
 
-    open_symbols = set(current_open[current_open["status"].isin(["OPEN", "PENDING_EXIT"])]["symbol"].unique().tolist()) if not current_open.empty else set()
+    open_symbols = (
+        set(current_open[current_open["status"].isin(["OPEN", "PENDING_EXIT"])]["symbol"]
+            .unique().tolist())
+        if not current_open.empty else set()
+    )
 
-    # Sells for tomorrow: currently open names whose latest close > ma_5
-    held_day = day[day["symbol"].isin(open_symbols)].copy()
-    sell_candidates = held_day[held_day["close"] > held_day["ma_5"]].copy()
-    sell_symbols = sorted(sell_candidates["symbol"].unique().tolist())
+    # ── Exit signals: close > MA-20 (was MA-5) ────────────────────────────────
+    held_day      = day[day["symbol"].isin(open_symbols)].copy()
+    held_day      = held_day.dropna(subset=[exit_ma])
+    sell_candidates = held_day[held_day["close"] > held_day[exit_ma]].copy()
+    sell_symbols    = sorted(sell_candidates["symbol"].unique().tolist())
 
-    # Buys for tomorrow: new qualifying names not already open/pending
+    # ── Entry signals with ML scoring + VIX gate ──────────────────────────────
     buy_candidates = entry_candidates[~entry_candidates["symbol"].isin(open_symbols)].copy()
 
-    open_count = len(open_symbols)
+    open_count   = len(open_symbols)
     buy_capacity = max(0, MAX_TOTAL_OPEN_POSITIONS - open_count + len(sell_symbols))
     buy_capacity = min(buy_capacity, MAX_NEW_BUYS_PER_DAY)
 
-    buy_symbols = buy_candidates["symbol"].head(buy_capacity).tolist()
+    # Get SPY and VIX rows for the signal date
+    spy_row = None
+    if not spy_feat_idx.empty and last_good_date in spy_feat_idx.index:
+        spy_row = spy_feat_idx.loc[last_good_date]
 
-    upsert_plan(plan_date=next_td, buy_symbols=buy_symbols, sell_symbols=sell_symbols)
+    vix_row = None
+    vix_close_today = None
+    in_vix_danger   = False
+    if not vix_idx.empty and last_good_date in vix_idx.index:
+        vix_row        = vix_idx.loc[last_good_date]
+        vix_close_today = float(vix_row["vix_close"])
+        in_vix_danger   = VIX_GATE_LO <= vix_close_today <= VIX_GATE_HI
+
+    buy_symbols  = []
+    buy_notionals = {}
+
+    gated_count = 0
+    if in_vix_danger:
+        gated_count = len(buy_candidates.head(buy_capacity))
+        buy_symbols  = []
+        buy_notionals = {}
+        print(f"  🚫 VIX GATE: VIX={vix_close_today:.1f} in danger zone [{VIX_GATE_LO:.0f}-{VIX_GATE_HI:.0f}]. "
+              f"Skipping all {gated_count} entry candidates.")
+    else:
+        candidates_capped = buy_candidates.head(buy_capacity)
+        for _, cand_row in candidates_capped.iterrows():
+            sym      = cand_row["symbol"]
+            quintile, notional, pred = score_candidate(cand_row, model_payload, spy_row, vix_row)
+            buy_symbols.append(sym)
+            buy_notionals[sym] = notional
+
+    upsert_plan(
+        plan_date=next_td,
+        buy_symbols=buy_symbols,
+        sell_symbols=sell_symbols,
+        buy_notionals=buy_notionals,
+    )
+
+    # ── Telegram summary ──────────────────────────────────────────────────────
+    vix_str   = f"{vix_close_today:.1f}" if vix_close_today else "N/A"
+    model_str = f"v6 ({model_payload.get('trained_on','?')})" if model_payload else "FLAT $200 (no model)"
+
+    notional_summary = ""
+    if buy_symbols and buy_notionals:
+        q_dist = {}
+        for sym in buy_symbols:
+            n = buy_notionals.get(sym, NOTIONAL_PER_POSITION)
+            q_dist[n] = q_dist.get(n, 0) + 1
+        parts = [f"${k}×{v}" for k, v in sorted(q_dist.items())]
+        notional_summary = f"  Notionals: {', '.join(parts)}"
 
     msg = [
-        f"📊 {BOT_NAME} After-Close Plan Created",
-        f"Signal date used: {last_good_date}",
-        f"Plan date (next open): {next_td}",
-        f"Tradable universe (price>=${MIN_PRICE}): {len(tradable)}",
-        f"Open symbols now: {open_count}",
-        f"Sell signals for tomorrow ({len(sell_symbols)}): {', '.join(sell_symbols) if sell_symbols else 'None'}",
-        f"Entry candidates ({len(entry_candidates)}): {len(entry_candidates)}",
-        f"Buy capacity tomorrow: {buy_capacity}",
-        f"Buys tomorrow ({len(buy_symbols)}): {', '.join(buy_symbols) if buy_symbols else 'None'}",
+        f"📊 {BOT_NAME} After-Close Plan  (v6 ML + VIX Gate)",
+        f"Signal date : {last_good_date}",
+        f"Plan date   : {next_td}",
+        f"Universe    : {len(tradable)} tradable",
+        f"VIX today   : {vix_str}" + (" ⚠️ DANGER ZONE — no buys" if in_vix_danger else ""),
+        f"ML model    : {model_str}",
+        f"Open now    : {open_count}",
+        f"Sell signals: {len(sell_symbols)} → {', '.join(sell_symbols) if sell_symbols else 'None'}",
+        f"Entry cands : {len(entry_candidates)} (RSI-2 < {RSI_ENTRY_THRESHOLD})",
+        f"Buy capacity: {buy_capacity}",
+        f"Buys planned: {len(buy_symbols)} → {', '.join(buy_symbols) if buy_symbols else 'None'}",
     ]
+    if notional_summary:
+        msg.append(notional_summary)
+    if gated_count > 0:
+        msg.append(f"  VIX gated : {gated_count} trade(s) skipped")
 
     tg_send("\n".join(msg))
     log_event("AFTER_CLOSE", " | ".join(msg))

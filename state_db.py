@@ -1,4 +1,5 @@
 import os
+import json
 import pandas as pd
 
 import psycopg
@@ -64,10 +65,15 @@ def init_db():
                     plan_date TEXT PRIMARY KEY,
                     buy_symbols TEXT,
                     sell_symbols TEXT,
+                    buy_notionals TEXT,
                     created_at TIMESTAMPTZ DEFAULT NOW(),
                     executed INTEGER DEFAULT 0,
                     executed_at TIMESTAMPTZ
                 );
+                """)
+                # Migration: add buy_notionals if it doesn't exist yet
+                cur.execute(f"""
+                ALTER TABLE {PLANNED_TABLE} ADD COLUMN IF NOT EXISTS buy_notionals TEXT;
                 """)
 
                 cur.execute(f"""
@@ -127,11 +133,17 @@ def init_db():
             plan_date TEXT PRIMARY KEY,
             buy_symbols TEXT,
             sell_symbols TEXT,
+            buy_notionals TEXT,
             created_at TEXT DEFAULT (datetime('now')),
             executed INTEGER DEFAULT 0,
             executed_at TEXT
         );
         """)
+        # Migration: add buy_notionals column if this is an existing DB
+        try:
+            c.execute(f"ALTER TABLE {PLANNED_TABLE} ADD COLUMN buy_notionals TEXT")
+        except Exception:
+            pass  # column already exists
 
         c.execute(f"""
         CREATE TABLE IF NOT EXISTS {EVENTS_TABLE} (
@@ -173,37 +185,44 @@ def log_event(event_type: str, message: str):
         c.commit()
 
 
-def upsert_plan(plan_date: str, buy_symbols, sell_symbols):
-    buys = ",".join(buy_symbols) if buy_symbols else ""
+def upsert_plan(plan_date: str, buy_symbols, sell_symbols, buy_notionals: dict = None):
+    """
+    buy_notionals: dict of {symbol: notional} for ML-sized positions.
+                   If None or empty, at_open.py falls back to NOTIONAL_PER_POSITION.
+    """
+    buys  = ",".join(buy_symbols)  if buy_symbols  else ""
     sells = ",".join(sell_symbols) if sell_symbols else ""
+    notionals_json = json.dumps(buy_notionals) if buy_notionals else ""
 
     if _use_postgres():
         with _pg_conn() as c:
             with c.cursor() as cur:
                 cur.execute(f"""
-                INSERT INTO {PLANNED_TABLE}(plan_date, buy_symbols, sell_symbols, executed, executed_at)
-                VALUES (%s, %s, %s, 0, NULL)
+                INSERT INTO {PLANNED_TABLE}(plan_date, buy_symbols, sell_symbols, buy_notionals, executed, executed_at)
+                VALUES (%s, %s, %s, %s, 0, NULL)
                 ON CONFLICT(plan_date) DO UPDATE SET
                     buy_symbols=EXCLUDED.buy_symbols,
                     sell_symbols=EXCLUDED.sell_symbols,
+                    buy_notionals=EXCLUDED.buy_notionals,
                     created_at=NOW(),
                     executed=0,
                     executed_at=NULL;
-                """, (plan_date, buys, sells))
+                """, (plan_date, buys, sells, notionals_json))
             c.commit()
         return
 
     with _sqlite_conn() as c:
         c.execute(f"""
-        INSERT INTO {PLANNED_TABLE}(plan_date, buy_symbols, sell_symbols, executed, executed_at)
-        VALUES (?, ?, ?, 0, NULL)
+        INSERT INTO {PLANNED_TABLE}(plan_date, buy_symbols, sell_symbols, buy_notionals, executed, executed_at)
+        VALUES (?, ?, ?, ?, 0, NULL)
         ON CONFLICT(plan_date) DO UPDATE SET
             buy_symbols=excluded.buy_symbols,
             sell_symbols=excluded.sell_symbols,
+            buy_notionals=excluded.buy_notionals,
             created_at=datetime('now'),
             executed=0,
             executed_at=NULL;
-        """, (plan_date, buys, sells))
+        """, (plan_date, buys, sells, notionals_json))
         c.commit()
 
 
@@ -212,32 +231,46 @@ def get_plan(plan_date: str):
         with _pg_conn() as c:
             with c.cursor() as cur:
                 cur.execute(f"""
-                    SELECT plan_date, buy_symbols, sell_symbols, COALESCE(executed,0) AS executed
+                    SELECT plan_date, buy_symbols, sell_symbols, buy_notionals,
+                           COALESCE(executed,0) AS executed
                     FROM {PLANNED_TABLE} WHERE plan_date=%s
                 """, (plan_date,))
                 row = cur.fetchone()
         if not row:
             return None
+        notionals = {}
+        try:
+            notionals = json.loads(row["buy_notionals"] or "{}") or {}
+        except Exception:
+            pass
         return {
             "plan_date": row["plan_date"],
             "buy_symbols": [s for s in (row["buy_symbols"] or "").split(",") if s],
             "sell_symbols": [s for s in (row["sell_symbols"] or "").split(",") if s],
+            "buy_notionals": notionals,
             "executed": bool(row["executed"]),
         }
 
     with _sqlite_conn() as c:
         cur = c.execute(f"""
-            SELECT plan_date, buy_symbols, sell_symbols, COALESCE(executed,0)
+            SELECT plan_date, buy_symbols, sell_symbols, buy_notionals,
+                   COALESCE(executed,0)
             FROM {PLANNED_TABLE} WHERE plan_date=?
         """, (plan_date,))
         row = cur.fetchone()
     if not row:
         return None
+    notionals = {}
+    try:
+        notionals = json.loads(row[3] or "{}") or {}
+    except Exception:
+        pass
     return {
         "plan_date": row[0],
         "buy_symbols": [s for s in (row[1] or "").split(",") if s],
         "sell_symbols": [s for s in (row[2] or "").split(",") if s],
-        "executed": bool(row[3]),
+        "buy_notionals": notionals,
+        "executed": bool(row[4]),
     }
 
 

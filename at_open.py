@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta
 import pytz
 
-from bot_config import require_env, BOT_NAME, NOTIONAL_PER_POSITION
+from bot_config import require_env, BOT_NAME, NOTIONAL_PER_POSITION, QUINTILE_SIZE
 from alpaca_utils import (
     get_trading_calendar,
     submit_market_order,
@@ -251,29 +251,36 @@ def main():
     if skip_buys:
         buy_msgs.append("No buys (plan already executed).")
     else:
+        # Per-symbol ML notionals (from after_close.py ML scoring).
+        # Falls back to NOTIONAL_PER_POSITION if not present.
+        plan_notionals = plan.get("buy_notionals") or {}
+
         for sym in plan.get("buy_symbols", []):
             if lot_exists_for_entry(sym, exec_date_str):
                 buy_msgs.append(f"⏭️ SKIP already have lot for {sym} entry={exec_date_str}")
                 continue
 
+            # Use ML-assigned notional; fall back to flat $200
+            notional = float(plan_notionals.get(sym, NOTIONAL_PER_POSITION))
+
             entry_client_order_id = f"rsibot-{exec_date_str}-{sym}-buy"
 
             if DRY_RUN:
-                buy_msgs.append(f"🧪 DRY_RUN would BUY {sym} notional=${NOTIONAL_PER_POSITION:.2f}")
+                buy_msgs.append(f"🧪 DRY_RUN would BUY {sym} notional=${notional:.2f}")
                 continue
 
             try:
                 add_lot_pending_entry(
                     symbol=sym,
                     entry_date=exec_date_str,
-                    notional=NOTIONAL_PER_POSITION,
+                    notional=notional,
                     entry_client_order_id=entry_client_order_id,
                 )
 
                 resp = submit_market_order(
                     symbol=sym,
                     side="buy",
-                    notional=NOTIONAL_PER_POSITION,
+                    notional=notional,
                     qty=None,
                     time_in_force="day",
                     client_order_id=entry_client_order_id,
@@ -305,7 +312,7 @@ def main():
                     filled_at=o.get("filled_at") or datetime.now(ET).isoformat(),
                 )
 
-                buy_msgs.append(f"✅ BUY filled: {sym} qty={filled_qty:.6f} avg=${avg_entry:.2f}")
+                buy_msgs.append(f"✅ BUY filled: {sym} notional=${notional:.0f} qty={filled_qty:.6f} avg=${avg_entry:.2f}")
                 buy_success += 1
 
             except Exception as e:
