@@ -50,7 +50,7 @@ from telegram_utils import tg_send
 
 ET = pytz.timezone("America/New_York")
 
-TEST_TODAY = None   # override for backtesting, e.g. "2024-01-05"
+TEST_TODAY = '2024-08-06'   # override for backtesting, e.g. "2024-01-05"
 
 SPY_SYMBOL = "SPY"
 
