@@ -22,8 +22,8 @@ from telegram_utils import tg_send
 
 ET = pytz.timezone("America/New_York")
 
-DRY_RUN = True
-FORCE_EXEC_DATE = '2024-08-07'
+DRY_RUN = False
+FORCE_EXEC_DATE = None
 
 MIN_SELL_QTY = 1e-6
 FILL_TIMEOUT_SEC = 75
