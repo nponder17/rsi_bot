@@ -45,9 +45,14 @@ def add_indicators(df: pd.DataFrame, rsi_period: int = 2) -> pd.DataFrame:
     df["vol_ratio"] = df["volume"] / df["vol_ma20"]
 
     # Returns
+    df["ret_1d"]  = g["close"].pct_change(1) .reset_index(level=0, drop=True)
     df["ret_5d"]  = g["close"].pct_change(5) .reset_index(level=0, drop=True) * 100
     df["ret_10d"] = g["close"].pct_change(10).reset_index(level=0, drop=True) * 100
     df["ret_20d"] = g["close"].pct_change(20).reset_index(level=0, drop=True) * 100
+
+    # rv_5: 5-day realised volatility (rolling std of daily returns)
+    # Used as a cross-sectional filter: only enter top 50% most volatile stocks.
+    df["rv_5"] = g["ret_1d"].rolling(5, min_periods=3).std().reset_index(level=0, drop=True)
 
     # ATR-14
     df["atr_14"] = g.apply(

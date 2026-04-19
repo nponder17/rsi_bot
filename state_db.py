@@ -15,6 +15,7 @@ LOTS_TABLE = "rsi_lots"
 PLANNED_TABLE = "rsi_planned"
 EVENTS_TABLE = "rsi_events"
 EQUITY_TABLE = "rsi_equity_snapshots"
+LLM_GATE_LOG_TABLE = "rsi_llm_gate_log"
 
 
 def _use_postgres() -> bool:
@@ -98,6 +99,28 @@ def init_db():
                 );
                 """)
 
+                cur.execute(f"""
+                CREATE TABLE IF NOT EXISTS {LLM_GATE_LOG_TABLE} (
+                    log_id          BIGSERIAL PRIMARY KEY,
+                    signal_date     TEXT NOT NULL,
+                    symbol          TEXT NOT NULL,
+                    rsi_2           DOUBLE PRECISION,
+                    ret_5d          DOUBLE PRECISION,
+                    action          TEXT,
+                    sentiment_score DOUBLE PRECISION,
+                    confidence      DOUBLE PRECISION,
+                    event_type      TEXT,
+                    reason          TEXT,
+                    key_headline    TEXT,
+                    n_articles      INTEGER,
+                    n_filings       INTEGER,
+                    created_at      TIMESTAMPTZ DEFAULT NOW(),
+                    UNIQUE (signal_date, symbol)
+                );
+                """)
+                cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{LLM_GATE_LOG_TABLE}_date ON {LLM_GATE_LOG_TABLE}(signal_date);")
+                cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{LLM_GATE_LOG_TABLE}_action ON {LLM_GATE_LOG_TABLE}(action);")
+
                 cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{LOTS_TABLE}_status_symbol ON {LOTS_TABLE}(status, symbol);")
                 cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{LOTS_TABLE}_symbol_entry ON {LOTS_TABLE}(symbol, entry_date);")
             c.commit()
@@ -167,8 +190,84 @@ def init_db():
         );
         """)
 
+        c.execute(f"""
+        CREATE TABLE IF NOT EXISTS {LLM_GATE_LOG_TABLE} (
+            log_id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            signal_date     TEXT NOT NULL,
+            symbol          TEXT NOT NULL,
+            rsi_2           REAL,
+            ret_5d          REAL,
+            action          TEXT,
+            sentiment_score REAL,
+            confidence      REAL,
+            event_type      TEXT,
+            reason          TEXT,
+            key_headline    TEXT,
+            n_articles      INTEGER,
+            n_filings       INTEGER,
+            created_at      TEXT DEFAULT (datetime('now')),
+            UNIQUE (signal_date, symbol)
+        );
+        """)
+        c.execute(f"CREATE INDEX IF NOT EXISTS idx_{LLM_GATE_LOG_TABLE}_date ON {LLM_GATE_LOG_TABLE}(signal_date);")
+        c.execute(f"CREATE INDEX IF NOT EXISTS idx_{LLM_GATE_LOG_TABLE}_action ON {LLM_GATE_LOG_TABLE}(action);")
+
         c.execute(f"CREATE INDEX IF NOT EXISTS idx_{LOTS_TABLE}_status_symbol ON {LOTS_TABLE}(status, symbol);")
         c.execute(f"CREATE INDEX IF NOT EXISTS idx_{LOTS_TABLE}_symbol_entry ON {LOTS_TABLE}(symbol, entry_date);")
+        c.commit()
+
+
+def log_llm_gate_decision(
+    signal_date     : str,
+    symbol          : str,
+    rsi_2           : float,
+    ret_5d          : float,
+    action          : str,
+    sentiment_score : float,
+    confidence      : float,
+    event_type      : str,
+    reason          : str,
+    key_headline    : str,
+    n_articles      : int,
+    n_filings       : int,
+):
+    """Log one LLM gate decision. UPSERT so re-runs on the same date overwrite cleanly."""
+    vals = (signal_date, symbol, rsi_2, ret_5d, action, sentiment_score,
+            confidence, event_type, reason, key_headline, n_articles, n_filings)
+
+    if _use_postgres():
+        with _pg_conn() as c:
+            with c.cursor() as cur:
+                cur.execute(f"""
+                INSERT INTO {LLM_GATE_LOG_TABLE}
+                    (signal_date, symbol, rsi_2, ret_5d, action, sentiment_score,
+                     confidence, event_type, reason, key_headline, n_articles, n_filings)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (signal_date, symbol) DO UPDATE SET
+                    rsi_2=EXCLUDED.rsi_2, ret_5d=EXCLUDED.ret_5d,
+                    action=EXCLUDED.action, sentiment_score=EXCLUDED.sentiment_score,
+                    confidence=EXCLUDED.confidence, event_type=EXCLUDED.event_type,
+                    reason=EXCLUDED.reason, key_headline=EXCLUDED.key_headline,
+                    n_articles=EXCLUDED.n_articles, n_filings=EXCLUDED.n_filings,
+                    created_at=NOW();
+                """, vals)
+            c.commit()
+        return
+
+    with _sqlite_conn() as c:
+        c.execute(f"""
+        INSERT INTO {LLM_GATE_LOG_TABLE}
+            (signal_date, symbol, rsi_2, ret_5d, action, sentiment_score,
+             confidence, event_type, reason, key_headline, n_articles, n_filings)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT (signal_date, symbol) DO UPDATE SET
+            rsi_2=excluded.rsi_2, ret_5d=excluded.ret_5d,
+            action=excluded.action, sentiment_score=excluded.sentiment_score,
+            confidence=excluded.confidence, event_type=excluded.event_type,
+            reason=excluded.reason, key_headline=excluded.key_headline,
+            n_articles=excluded.n_articles, n_filings=excluded.n_filings,
+            created_at=datetime('now');
+        """, vals)
         c.commit()
 
 

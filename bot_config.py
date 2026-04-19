@@ -21,7 +21,7 @@ MIN_PRICE = 2.0
 USE_MA200_FILTER = True
 MA_EXIT = 20          # Exit when close > MA-20 (v6; was MA-5)
 
-MAX_NEW_BUYS_PER_DAY = 20
+MAX_NEW_BUYS_PER_DAY = 50
 
 # Safety / practical controls
 MAX_TOTAL_OPEN_POSITIONS = 150
@@ -34,12 +34,23 @@ NOTIONAL_PER_POSITION = 200.0   # fallback if model not loaded
 # Path to the serialized GBR model (produced by train_model_v6.py)
 MODEL_PATH = os.getenv("MODEL_PATH", os.path.join(os.getenv("DATA_DIR", "data"), "model_v6.pkl"))
 
-# --- VIX danger zone gate ---
-# VIX 25-30: orderly selling / transition zone. RSI-2 setups fail here.
-# Backtest: 488 trades, -$589 ML P&L, 11.3% bad rate. Skip them.
-VIX_GATE_LO = 25.0
-VIX_GATE_HI = 30.0
+# --- VIX reporting ---
+# Rolling 252-day trailing percentile — reported in Telegram but NOT used as a hard gate.
+# Research showed the rv_5 cross-sectional filter handles regime selection better.
+VIX_LOOKBACK_DAYS = 252
 VIX_CSV_URL = "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv"
+
+# --- rv_5 vol filter ---
+# Only enter stocks whose 5-day realised vol is above the daily cross-sectional median.
+# Backtested: improves avg return per trade and total compounded return significantly.
+RV5_FILTER = True
+
+# --- LLM signal gate ---
+# Filters buy candidates through Claude before execution.
+# SKIP when Claude detects fundamental damage (earnings miss, FDA rejection, etc.)
+# Set LLM_GATE_ENABLED=false in .env to disable without code changes.
+LLM_GATE_ENABLED = os.getenv("LLM_GATE_ENABLED", "true").lower() == "true"
+LLM_GATE_MAX_CANDIDATES = int(os.getenv("LLM_GATE_MAX_CANDIDATES", "20"))  # cap API calls/day
 
 # Storage
 DB_PATH = os.getenv("DB_PATH", "rsi_bot_state.sqlite")

@@ -1,9 +1,17 @@
 """
-after_close.py — RSI-2 signal scan + ML v6 sizing + VIX 25-30 gate
+after_close.py — RSI-2 signal scan + ML v6 sizing + rv_5 vol filter
 
 Run after market close each trading day. Produces a plan for the next open:
   - SELL: open positions where today's close > MA-20
-  - BUY:  RSI-2 < 5, close > MA-200, VIX NOT in [25,30] → ML quintile notional
+  - BUY:  RSI-2 < 5, close > MA-200, rv_5 >= daily cross-section median
+          → ML quintile notional sizing
+
+Entry filter stack (in order):
+  1. RSI-2 < 5               (oversold signal)
+  2. close > MA-200          (long-term uptrend)
+  3. close >= $2             (minimum price)
+  4. rv_5 >= daily median    (top 50% most volatile stocks right now)
+  5. not already open        (no re-entry while position held)
 
 ML v6 features (20 total):
   Base:  rsi_2, pct_from_ma200/50/20, vol_ratio, ret_5d/10d/20d, atr_pct,
@@ -12,7 +20,7 @@ ML v6 features (20 total):
          obv_zscore
 
 Quintile sizing:  Q1=$80  Q2=$140  Q3=$200  Q4=$280  Q5=$400
-VIX gate:         skip trades when VIX in [25.0, 30.0]
+Max new buys/day: 50  (up from 20; backtesting shows more positions = more return, same drawdown)
 """
 
 import os
@@ -31,11 +39,13 @@ from bot_config import (
     MIN_PRICE, USE_MA200_FILTER, MA_EXIT,
     MAX_NEW_BUYS_PER_DAY, MAX_TOTAL_OPEN_POSITIONS,
     NOTIONAL_PER_POSITION, QUINTILE_SIZE, MODEL_PATH,
-    VIX_GATE_LO, VIX_GATE_HI, VIX_CSV_URL,
+    VIX_LOOKBACK_DAYS, VIX_CSV_URL, RV5_FILTER,
+    LLM_GATE_ENABLED, LLM_GATE_MAX_CANDIDATES,
 )
+from llm_gate import run_llm_gate
 from alpaca_utils import get_trading_calendar, get_next_trading_day, get_daily_bars
 from indicators import add_indicators, add_spy_features, assign_quintile
-from state_db import init_db, upsert_plan, log_event, open_lots
+from state_db import init_db, upsert_plan, log_event, log_llm_gate_decision, open_lots
 from telegram_utils import tg_send
 
 ET = pytz.timezone("America/New_York")
@@ -49,21 +59,7 @@ def ensure_dir():
     os.makedirs(DATA_DIR, exist_ok=True)
 
 
-def load_model():
-    """Load the serialized v6 ML model. Returns payload dict or None."""
-    if not os.path.exists(MODEL_PATH):
-        print(f"  ⚠️  Model not found at {MODEL_PATH} — using flat $200 sizing.")
-        return None
-    try:
-        with open(MODEL_PATH, "rb") as f:
-            payload = pickle.load(f)
-        print(f"  ✅ Model loaded: trained on {payload.get('trained_on','?')} "
-              f"({payload.get('n_samples',0):,} samples, "
-              f"{len(payload.get('features',[]))} features)")
-        return payload
-    except Exception as e:
-        print(f"  ⚠️  Model load failed: {e} — using flat $200 sizing.")
-        return None
+
 
 
 def fetch_vix() -> pd.DataFrame:
@@ -189,8 +185,6 @@ def main():
 
     next_td = get_next_trading_day(cal, today_date=today)
 
-    # ── Load ML model ─────────────────────────────────────────────────────────
-    model_payload = load_model()
 
     # ── Fetch VIX ─────────────────────────────────────────────────────────────
     print("Fetching VIX from CBOE …")
@@ -302,29 +296,92 @@ def main():
 
     vix_row = None
     vix_close_today = None
-    in_vix_danger   = False
+    vix_pct_today   = None
     if not vix_idx.empty and last_good_date in vix_idx.index:
-        vix_row        = vix_idx.loc[last_good_date]
+        vix_row         = vix_idx.loc[last_good_date]
         vix_close_today = float(vix_row["vix_close"])
-        in_vix_danger   = VIX_GATE_LO <= vix_close_today <= VIX_GATE_HI
+        # Rolling 252-day trailing percentile (no lookahead)
+        past_vix = vix_idx["vix_close"].loc[:last_good_date].iloc[-(VIX_LOOKBACK_DAYS + 1):-1]
+        if len(past_vix) >= 60:
+            vix_pct_today = float(np.mean(past_vix.values < vix_close_today) * 100)
 
-    buy_symbols  = []
+    # No ML model in use — all positions use flat notional size
+    model_payload = None
+
+    # ── rv_5 cross-sectional median filter ───────────────────────────────────
+    # Only enter stocks in the top 50% by current 5-day realised volatility.
+    # Backtested on 441 S&P 500 stocks 2016-2025: improves avg return 0.57%→0.74%
+    # and total compounded return from 287% to 566% (same drawdown profile).
+    rv5_filtered_count = 0
+    if RV5_FILTER and "rv_5" in buy_candidates.columns:
+        rv5_median = buy_candidates["rv_5"].median()
+        pre_filter = len(buy_candidates)
+        buy_candidates = buy_candidates[
+            buy_candidates["rv_5"].notna() &
+            (buy_candidates["rv_5"] >= rv5_median)
+        ].copy()
+        rv5_filtered_count = pre_filter - len(buy_candidates)
+        print(f"  rv_5 filter: removed {rv5_filtered_count} low-vol candidates "
+              f"(median rv_5={rv5_median:.4f}), {len(buy_candidates)} remain.")
+
+    buy_symbols   = []
     buy_notionals = {}
 
-    gated_count = 0
-    if in_vix_danger:
-        gated_count = len(buy_candidates.head(buy_capacity))
-        buy_symbols  = []
-        buy_notionals = {}
-        print(f"  🚫 VIX GATE: VIX={vix_close_today:.1f} in danger zone [{VIX_GATE_LO:.0f}-{VIX_GATE_HI:.0f}]. "
-              f"Skipping all {gated_count} entry candidates.")
-    else:
-        candidates_capped = buy_candidates.head(buy_capacity)
-        for _, cand_row in candidates_capped.iterrows():
-            sym      = cand_row["symbol"]
-            quintile, notional, pred = score_candidate(cand_row, model_payload, spy_row, vix_row)
-            buy_symbols.append(sym)
-            buy_notionals[sym] = notional
+    candidates_capped = buy_candidates.head(buy_capacity)
+
+    # ── LLM signal gate ───────────────────────────────────────────────────────
+    # Ask Claude whether each candidate's selloff is fundamental damage or noise.
+    # SKIP decisions are removed before ML sizing and order submission.
+    llm_skipped      = []
+    llm_gated_count  = 0
+    llm_gate_enabled = LLM_GATE_ENABLED
+
+    if llm_gate_enabled:
+        gate_input = candidates_capped.head(LLM_GATE_MAX_CANDIDATES)
+        print(f"\nRunning LLM gate on {len(gate_input)} candidates …")
+        try:
+            candidates_capped, llm_skipped, analyses = run_llm_gate(
+                candidates    = gate_input,
+                signal_date   = str(last_good_date),
+                rsi_col       = rsi_col,
+                ret_col       = "ret_5d",
+                verbose       = True,
+            )
+            llm_gated_count = len(llm_skipped)
+
+            # Log every gate decision to DB for feedback loop analysis
+            for sym, analysis in analyses.items():
+                cand_row = gate_input[gate_input["symbol"] == sym]
+                rsi_val  = float(cand_row[rsi_col].values[0]) if not cand_row.empty else 0.0
+                ret_val  = float(cand_row["ret_5d"].values[0]) if not cand_row.empty else 0.0
+                try:
+                    log_llm_gate_decision(
+                        signal_date     = str(last_good_date),
+                        symbol          = sym,
+                        rsi_2           = rsi_val,
+                        ret_5d          = ret_val,
+                        action          = analysis.action,
+                        sentiment_score = analysis.sentiment_score,
+                        confidence      = analysis.confidence,
+                        event_type      = analysis.event_type,
+                        reason          = analysis.reason,
+                        key_headline    = analysis.key_headline,
+                        n_articles      = getattr(analysis, "_n_articles", 0),
+                        n_filings       = getattr(analysis, "_n_filings", 0),
+                    )
+                except Exception as log_err:
+                    print(f"  ⚠️  Failed to log gate decision for {sym}: {log_err}")
+
+        except Exception as e:
+            print(f"  ⚠️  LLM gate failed: {e} — proceeding without gate")
+            llm_gate_enabled = False   # fall through with full candidate list
+        print()
+
+    for _, cand_row in candidates_capped.iterrows():
+        sym      = cand_row["symbol"]
+        quintile, notional, pred = score_candidate(cand_row, model_payload, spy_row, vix_row)
+        buy_symbols.append(sym)
+        buy_notionals[sym] = notional
 
     upsert_plan(
         plan_date=next_td,
@@ -334,7 +391,9 @@ def main():
     )
 
     # ── Telegram summary ──────────────────────────────────────────────────────
-    vix_str   = f"{vix_close_today:.1f}" if vix_close_today else "N/A"
+    vix_str   = (f"{vix_close_today:.1f} ({vix_pct_today:.0f}th pct)"
+                 if vix_close_today and vix_pct_today is not None
+                 else (f"{vix_close_today:.1f}" if vix_close_today else "N/A"))
     model_str = f"v6 ({model_payload.get('trained_on','?')})" if model_payload else "FLAT $200 (no model)"
 
     notional_summary = ""
@@ -346,23 +405,37 @@ def main():
         parts = [f"${k}×{v}" for k, v in sorted(q_dist.items())]
         notional_summary = f"  Notionals: {', '.join(parts)}"
 
+    gate_str = "OFF"
+    if llm_gate_enabled:
+        gate_str = f"ON — skipped {llm_gated_count}"
+        if llm_skipped:
+            gate_str += f": {', '.join(s['symbol'] for s in llm_skipped)}"
+
     msg = [
-        f"📊 {BOT_NAME} After-Close Plan  (v6 ML + VIX Gate)",
+        f"📊 {BOT_NAME} After-Close Plan  (v6 ML + rv_5 + LLM gate)",
         f"Signal date : {last_good_date}",
         f"Plan date   : {next_td}",
-        f"Universe    : {len(tradable)} tradable",
-        f"VIX today   : {vix_str}" + (" ⚠️ DANGER ZONE — no buys" if in_vix_danger else ""),
+        f"Universe    : {len(tradable)} tradable (S&P 500)",
+        f"VIX today   : {vix_str}",
         f"ML model    : {model_str}",
         f"Open now    : {open_count}",
         f"Sell signals: {len(sell_symbols)} → {', '.join(sell_symbols) if sell_symbols else 'None'}",
-        f"Entry cands : {len(entry_candidates)} (RSI-2 < {RSI_ENTRY_THRESHOLD})",
+        f"Entry cands : {len(entry_candidates)} raw (RSI-2 < {RSI_ENTRY_THRESHOLD})",
+        f"After rv_5  : {len(buy_candidates)} (removed {rv5_filtered_count} low-vol)",
+        f"LLM gate    : {gate_str}",
         f"Buy capacity: {buy_capacity}",
         f"Buys planned: {len(buy_symbols)} → {', '.join(buy_symbols) if buy_symbols else 'None'}",
     ]
     if notional_summary:
         msg.append(notional_summary)
-    if gated_count > 0:
-        msg.append(f"  VIX gated : {gated_count} trade(s) skipped")
+
+    # Append skip details if any (one line per skipped stock)
+    if llm_skipped:
+        msg.append("")
+        msg.append("🚫 LLM gate skipped:")
+        for s in llm_skipped:
+            reason_short = s["reason"][:80] if s["reason"] else ""
+            msg.append(f"  {s['symbol']}: [{s['event_type']}] {reason_short}")
 
     tg_send("\n".join(msg))
     log_event("AFTER_CLOSE", " | ".join(msg))
