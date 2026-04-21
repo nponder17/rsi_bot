@@ -313,7 +313,7 @@ def page_positions():
         color = "color: green" if val > 0 else ("color: red" if val < 0 else "")
         return color
 
-    styled = df.style.applymap(color_ret, subset=["Return %"]).format({"Return %": "{:+.2f}%"})
+    styled = df.style.map(color_ret, subset=["Return %"]).format({"Return %": "{:+.2f}%"})
     st.dataframe(styled, use_container_width=True, hide_index=True)
 
     # P&L bar chart
@@ -430,7 +430,7 @@ def page_history():
         return "color: green" if val > 0 else "color: red"
 
     styled = display.style\
-        .applymap(color_ret, subset=["Return", "P&L $"])\
+        .map(color_ret, subset=["Return", "P&L $"])\
         .format({"Return": "{:+.2%}", "P&L $": "${:+.2f}",
                  "Notional": "${:.0f}", "Entry $": "${:.2f}", "Exit $": "${:.2f}"})
     st.dataframe(styled, use_container_width=True, hide_index=True)
