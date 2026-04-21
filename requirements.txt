@@ -7,3 +7,5 @@ ta
 scikit-learn
 psycopg[binary]
 anthropic
+streamlit
+plotly
