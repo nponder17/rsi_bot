@@ -45,6 +45,13 @@ VIX_CSV_URL = "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_Histo
 # Backtested: improves avg return per trade and total compounded return significantly.
 RV5_FILTER = True
 
+# --- Stop-loss ---
+# Sell at next open if a position closes <= entry_price * (1 + STOP_LOSS_PCT/100).
+# -12% optimum from sweep: cuts max DD ~9% → ~3.7%, raises Sharpe 0.50 → 0.68,
+# leaves CAGR essentially unchanged. Set STOP_LOSS_ENABLED=false in .env to disable.
+STOP_LOSS_ENABLED = os.getenv("STOP_LOSS_ENABLED", "true").lower() == "true"
+STOP_LOSS_PCT     = float(os.getenv("STOP_LOSS_PCT", "-12.0"))   # negative number
+
 # --- LLM signal gate ---
 # Filters buy candidates through Claude before execution.
 # SKIP when Claude detects fundamental damage (earnings miss, FDA rejection, etc.)

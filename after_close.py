@@ -1,8 +1,9 @@
 """
-after_close.py — RSI-2 signal scan + ML v6 sizing + rv_5 vol filter
+after_close.py — RSI-2 signal scan + ML v6 sizing + rv_5 vol filter + stop-loss
 
 Run after market close each trading day. Produces a plan for the next open:
-  - SELL: open positions where today's close > MA-20
+  - SELL: open positions where today's close > MA-20  (existing rule)
+          OR close <= entry_price * (1 + STOP_LOSS_PCT/100)  (stop-loss)
   - BUY:  RSI-2 < 5, close > MA-200, rv_5 >= daily cross-section median
           → ML quintile notional sizing
 
@@ -13,14 +14,15 @@ Entry filter stack (in order):
   4. rv_5 >= daily median    (top 50% most volatile stocks right now)
   5. not already open        (no re-entry while position held)
 
-ML v6 features (20 total):
-  Base:  rsi_2, pct_from_ma200/50/20, vol_ratio, ret_5d/10d/20d, atr_pct,
-         spy_ret_5d/20d, spy_rsi_14, spy_above_200/50
-  New:   close_in_range, dist_52wk_low, consec_down_days, vix_close, vix_ret_5d,
-         obv_zscore
+Exit triggers:
+  - STOP_LOSS: close <= entry_price * 0.88 (12% drop)  [STOP_LOSS_PCT = -12]
+  - MA20:      close > 20-day moving average           [MA_EXIT = 20]
+  - Stop-loss takes priority if both fire same day.
+
+ML v6 features (20 total) — currently disabled; flat NOTIONAL_PER_POSITION used.
 
 Quintile sizing:  Q1=$80  Q2=$140  Q3=$200  Q4=$280  Q5=$400
-Max new buys/day: 50  (up from 20; backtesting shows more positions = more return, same drawdown)
+Max new buys/day: 50
 """
 
 import os
@@ -41,6 +43,7 @@ from bot_config import (
     NOTIONAL_PER_POSITION, QUINTILE_SIZE, MODEL_PATH,
     VIX_LOOKBACK_DAYS, VIX_CSV_URL, RV5_FILTER,
     LLM_GATE_ENABLED, LLM_GATE_MAX_CANDIDATES,
+    STOP_LOSS_ENABLED, STOP_LOSS_PCT,
 )
 from llm_gate import run_llm_gate
 from alpaca_utils import get_trading_calendar, get_next_trading_day, get_daily_bars
@@ -57,9 +60,6 @@ SPY_SYMBOL = "SPY"
 
 def ensure_dir():
     os.makedirs(DATA_DIR, exist_ok=True)
-
-
-
 
 
 def fetch_vix() -> pd.DataFrame:
@@ -276,13 +276,54 @@ def main():
         if not current_open.empty else set()
     )
 
-    # ── Exit signals: close > MA-20 (was MA-5) ────────────────────────────────
-    held_day      = day[day["symbol"].isin(open_symbols)].copy()
-    held_day      = held_day.dropna(subset=[exit_ma])
-    sell_candidates = held_day[held_day["close"] > held_day[exit_ma]].copy()
-    sell_symbols    = sorted(sell_candidates["symbol"].unique().tolist())
+    # Build per-symbol entry-price lookup for stop-loss check.
+    # If a symbol has multiple lots open (rare — strategy disallows re-entry,
+    # but defensive), use the WEIGHTED-AVERAGE entry price across qty.
+    entry_price_by_symbol = {}
+    if not current_open.empty:
+        active = current_open[current_open["status"].isin(["OPEN", "PENDING_EXIT"])].copy()
+        for sym, grp in active.groupby("symbol"):
+            try:
+                qtys   = grp["qty"].astype(float)
+                prices = grp["avg_entry_price"].astype(float)
+                total_qty = qtys.sum()
+                if total_qty > 0:
+                    entry_price_by_symbol[sym] = float((qtys * prices).sum() / total_qty)
+            except (KeyError, ValueError, TypeError):
+                continue   # skip if entry data malformed; lot will just not get stop check
 
-    # ── Entry signals with ML scoring + VIX gate ──────────────────────────────
+    # ── Exit signals: stop-loss (priority) + MA-20 ────────────────────────────
+    held_day = day[day["symbol"].isin(open_symbols)].copy()
+    held_day = held_day.dropna(subset=[exit_ma])
+
+    sell_reasons = {}   # symbol -> "STOP" or "MA20"
+
+    # Stop-loss check first (priority)
+    n_stop_triggers = 0
+    if STOP_LOSS_ENABLED and entry_price_by_symbol:
+        stop_mult = 1.0 + STOP_LOSS_PCT / 100.0   # e.g. 0.88 for -12%
+        for _, hrow in held_day.iterrows():
+            sym   = hrow["symbol"]
+            close = hrow["close"]
+            entry = entry_price_by_symbol.get(sym)
+            if entry is None or pd.isna(close) or entry <= 0:
+                continue
+            if close <= entry * stop_mult:
+                sell_reasons[sym] = "STOP"
+                n_stop_triggers += 1
+
+    # MA-20 check for everything not already flagged for stop
+    for _, hrow in held_day.iterrows():
+        sym = hrow["symbol"]
+        if sym in sell_reasons:
+            continue   # already flagged by stop
+        if hrow["close"] > hrow[exit_ma]:
+            sell_reasons[sym] = "MA20"
+
+    sell_symbols = sorted(sell_reasons.keys())
+    n_ma20_triggers = sum(1 for r in sell_reasons.values() if r == "MA20")
+
+    # ── Entry signals with ML scoring ─────────────────────────────────────────
     buy_candidates = entry_candidates[~entry_candidates["symbol"].isin(open_symbols)].copy()
 
     open_count   = len(open_symbols)
@@ -309,9 +350,6 @@ def main():
     model_payload = None
 
     # ── rv_5 cross-sectional median filter ───────────────────────────────────
-    # Only enter stocks in the top 50% by current 5-day realised volatility.
-    # Backtested on 441 S&P 500 stocks 2016-2025: improves avg return 0.57%→0.74%
-    # and total compounded return from 287% to 566% (same drawdown profile).
     rv5_filtered_count = 0
     if RV5_FILTER and "rv_5" in buy_candidates.columns:
         rv5_median = buy_candidates["rv_5"].median()
@@ -330,8 +368,6 @@ def main():
     candidates_capped = buy_candidates.head(buy_capacity)
 
     # ── LLM signal gate ───────────────────────────────────────────────────────
-    # Ask Claude whether each candidate's selloff is fundamental damage or noise.
-    # SKIP decisions are removed before ML sizing and order submission.
     llm_skipped      = []
     llm_gated_count  = 0
     llm_gate_enabled = LLM_GATE_ENABLED
@@ -374,7 +410,7 @@ def main():
 
         except Exception as e:
             print(f"  ⚠️  LLM gate failed: {e} — proceeding without gate")
-            llm_gate_enabled = False   # fall through with full candidate list
+            llm_gate_enabled = False
         print()
 
     for _, cand_row in candidates_capped.iterrows():
@@ -411,15 +447,34 @@ def main():
         if llm_skipped:
             gate_str += f": {', '.join(s['symbol'] for s in llm_skipped)}"
 
+    stop_str = "OFF"
+    if STOP_LOSS_ENABLED:
+        stop_str = f"ON @ {STOP_LOSS_PCT:+.0f}%  ({n_stop_triggers} triggered today)"
+
+    # Sell breakdown by reason
+    if sell_symbols:
+        stop_syms = sorted([s for s, r in sell_reasons.items() if r == "STOP"])
+        ma20_syms = sorted([s for s, r in sell_reasons.items() if r == "MA20"])
+        sell_detail = []
+        if stop_syms:
+            sell_detail.append(f"🛑 STOP({len(stop_syms)}): {', '.join(stop_syms)}")
+        if ma20_syms:
+            sell_detail.append(f"📤 MA20({len(ma20_syms)}): {', '.join(ma20_syms)}")
+        sell_str = "  " + "\n  ".join(sell_detail)
+    else:
+        sell_str = "  None"
+
     msg = [
-        f"📊 {BOT_NAME} After-Close Plan  (v6 ML + rv_5 + LLM gate)",
+        f"📊 {BOT_NAME} After-Close Plan  (v6 + rv_5 + LLM gate + stop-loss)",
         f"Signal date : {last_good_date}",
         f"Plan date   : {next_td}",
         f"Universe    : {len(tradable)} tradable (S&P 500)",
         f"VIX today   : {vix_str}",
         f"ML model    : {model_str}",
+        f"Stop-loss   : {stop_str}",
         f"Open now    : {open_count}",
-        f"Sell signals: {len(sell_symbols)} → {', '.join(sell_symbols) if sell_symbols else 'None'}",
+        f"Sell signals: {len(sell_symbols)} total",
+        sell_str,
         f"Entry cands : {len(entry_candidates)} raw (RSI-2 < {RSI_ENTRY_THRESHOLD})",
         f"After rv_5  : {len(buy_candidates)} (removed {rv5_filtered_count} low-vol)",
         f"LLM gate    : {gate_str}",
